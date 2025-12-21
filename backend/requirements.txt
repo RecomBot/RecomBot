@@ -1,0 +1,32 @@
+# backend/requirements.txt (ОБНОВЛЕННЫЙ ВАРИАНТ)
+# Основные зависимости
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-dotenv==1.0.0
+httpx==0.27.0
+
+# Работа с данными и БД
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+alembic==1.12.1
+pydantic==2.9.0
+pydantic-settings==2.1.0
+
+# Аутентификация и безопасность
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# LLM
+# yandex-cloud - УДАЛИЛИ, заменим на прямые HTTP-запросы
+# openai оставляем как опциональную fallback-зависимость (можно комментировать)
+# openai==1.12.0
+ollama==0.6.1
+
+# Кэширование и утилиты
+redis==5.0.1
+
+# (Опционально, для разработки) Допишите в файл requirements-dev.txt позже:
+pytest==7.4.3
+pytest-asyncio==0.21.1
+# black==23.1p1.0
