@@ -1,0 +1,21 @@
+# Виртуальное окружение (везде в проекте)
+venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Логи
+*.log
+
+# Системные файлы
+Thumbs.db
+
+# Для Windows
+desktop.ini
