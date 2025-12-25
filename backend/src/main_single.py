@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import re
+from datetime import datetime, timedelta
 # from ollama import AsyncClient as OllamaAsyncClient
 # from ollama import Client as OllamaSyncClient
 from ollama import AsyncClient as OllamaCloudClient
@@ -102,7 +103,9 @@ class Place(Base):
     price_level = Column(Integer, default=1)
     tags = Column(JSON, default=list)
     rating = Column(Float, default=0.0)
+    working_hours = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
+    expired_at = Column(DateTime(timezone=True), nullable=True, index=True)
     
     # Модерация мест
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
@@ -800,6 +803,7 @@ places_router = APIRouter()
 reviews_router = APIRouter()
 recommendations_router = APIRouter()
 moderation_router = APIRouter()
+parser_router = APIRouter()
 
 # ========== ЗАВИСИМОСТИ ДЛЯ ПРОВЕРКИ РОЛЕЙ ==========
 async def get_current_user(db: AsyncSession = Depends(get_db)) -> User:
@@ -1624,12 +1628,136 @@ async def get_chat_recommendations(
         logger.error(f"Ошибка получения чат-рекомендаций: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Парсер
+@parser_router.get("/status")
+async def get_parser_status(db: AsyncSession = Depends(get_db)):
+    """Получение статуса парсера"""
+    try:
+        # Получаем статистику по спарсенным местам
+        result = await db.execute(
+            select(func.count(Place.id))
+            .where(Place.created_by.isnot(None))
+        )
+        parsed_count = result.scalar() or 0
+        
+        # Получаем количество активных мест
+        result = await db.execute(
+            select(func.count(Place.id))
+            .where(Place.is_active == True)
+        )
+        active_count = result.scalar() or 0
+        
+        # Получаем количество просроченных мест
+        result = await db.execute(
+            select(func.count(Place.id))
+            .where(
+                Place.expired_at.isnot(None),
+                Place.expired_at < datetime.utcnow()
+            )
+        )
+        expired_count = result.scalar() or 0
+        
+        return {
+            "status": "running",
+            "parsed_places": parsed_count,
+            "active_places": active_count,
+            "expired_places": expired_count,
+            "last_check": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения статуса парсера: {e}")
+        return {"status": "error", "error": str(e)}
+
+@parser_router.post("/cleanup")
+async def cleanup_expired(
+    current_user: User = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db)
+):
+    """Ручная очистка просроченных мест"""
+    try:
+        current_time = datetime.utcnow()
+        
+        # Находим просроченные места
+        result = await db.execute(
+            select(Place).where(
+                Place.expired_at.isnot(None),
+                Place.expired_at < current_time,
+                Place.is_active == True
+            )
+        )
+        expired_places = result.scalars().all()
+        
+        if not expired_places:
+            return {"message": "Нет просроченных мест для очистки"}
+        
+        # Деактивируем
+        for place in expired_places:
+            place.is_active = False
+            place.moderation_status = "expired"
+            place.moderation_reason = f"Срок действия истек {place.expired_at}"
+        
+        await db.commit()
+        
+        return {
+            "message": f"Деактивировано {len(expired_places)} просроченных мест",
+            "deactivated_count": len(expired_places),
+            "moderator": current_user.username
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка очистки просроченных мест: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@parser_router.get("/places/expiring-soon")
+async def get_expiring_soon(
+    days: int = Query(7, ge=1, le=30),
+    db: AsyncSession = Depends(get_db)
+):
+    """Получение мест, срок действия которых скоро истекает"""
+    try:
+        threshold = datetime.utcnow() + timedelta(days=days)
+        
+        result = await db.execute(
+            select(Place)
+            .where(
+                Place.expired_at.isnot(None),
+                Place.expired_at <= threshold,
+                Place.expired_at > datetime.utcnow(),
+                Place.is_active == True
+            )
+            .order_by(Place.expired_at)
+        )
+        
+        places = result.scalars().all()
+        
+        return {
+            "places": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "category": p.category,
+                    "city": p.city,
+                    "expired_at": p.expired_at.isoformat() if p.expired_at else None,
+                    "days_left": (p.expired_at - datetime.utcnow()).days if p.expired_at else None
+                }
+                for p in places
+            ],
+            "total": len(places),
+            "threshold_days": days
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения истекающих мест: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # ========== ПОДКЛЮЧЕНИЕ РОУТЕРОВ ==========
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Аутентификация"])
 app.include_router(places_router, prefix="/api/v1/places", tags=["Места"])
 app.include_router(reviews_router, prefix="/api/v1/reviews", tags=["Отзывы"])
 app.include_router(moderation_router, prefix="/api/v1/moderation", tags=["Модерация"])
 app.include_router(recommendations_router, prefix="/api/v1/recommendations", tags=["Рекомендации"])
+app.include_router(parser_router, prefix="/api/v1/parser", tags=["Парсер"])
 
 # ========== ОСНОВНЫЕ ЭНДПОИНТЫ ==========
 @app.get("/")

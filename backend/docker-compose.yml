@@ -33,6 +33,30 @@ services:
       - ./src:/app/src
       - ./env:/app/.env  # Монтируем .env файл если нужно
     command: uvicorn src.main_single:app --host 0.0.0.0 --port 8000 --reload
+    # command: ["./entrypoint.sh"]
+
+  parser:
+    build: .
+    container_name: travel_parser
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      PARSE_INTERVAL_HOURS: ${PARSE_INTERVAL_HOURS:-24}
+      PLACE_EXPIRY_DAYS: ${PLACE_EXPIRY_DAYS:-30}
+      SELENIUM_HEADLESS: "True"
+      # Настройки для Selenium в Docker
+      DISPLAY: :99
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src
+    # command: python src/parser_unified.py --schedule
+    # command: ["./entrypoint.sh", "parser"]
+    # command: ["python", "src/parser_unified.py", "--all"]
+    # command: ["python", "src/aaa_parser_unified.py", "--once"]
+    command: ["python", "src/parser_main.py", "--once"]
 
   # Сервис базы данных PostgreSQL
   postgres:
