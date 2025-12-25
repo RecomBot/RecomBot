@@ -1,32 +1,8 @@
-# docker-compose.yml
+# docker-compose.yml — корень проекта RecomBot/
 version: '3.8'
 
 services:
-  # ───────────── BACKEND ─────────────
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: travel_backend
-    ports:
-      - "8001:8000"  # host:container
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/travel_db
-      - REDIS_URL=redis://redis:6379/0
-      - OLLAMA_API_KEY=${OLLAMA_API_KEY}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
-    env_file:
-      - .env
-    volumes:
-      - ./backend/src:/app/src
-
-  # ───────────── POSTGRES ─────────────
+  # ───────────── PostgreSQL ─────────────
   postgres:
     image: postgres:15-alpine
     container_name: travel_postgres
@@ -36,7 +12,7 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -46,7 +22,7 @@ services:
       retries: 10
       start_period: 10s
 
-  # ───────────── REDIS ─────────────
+  # ───────────── Redis ─────────────
   redis:
     image: redis:7-alpine
     container_name: travel_redis
@@ -55,21 +31,44 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-volumes:
-  postgres_data:
-  redis_data:
+  # ───────────── Backend (FastAPI) ─────────────
+  backend:
+    build:
+      context: .                     # ← контекст — корень проекта
+      dockerfile: backend/Dockerfile
+    container_name: travel_backend
+    ports:
+      - "8001:8000"                 # host:container
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - .env
+    volumes:
+      # Только для hot-reload в dev (не для продакшена!)
+      - ./backend/src:/app/src
 
-
-    # ───────────── TELEGRAM BOT ─────────────
+  # ───────────── Telegram Bot (aiogram) ─────────────
   bot:
     build:
-      context: ./GidRecBot
-      dockerfile: Dockerfile.bot
+      context: .                     # ← контекст — корень проекта
+      dockerfile: GidRecBot/Dockerfile.bot
     container_name: travel_bot
     depends_on:
       - backend
     env_file:
       - .env
-    volumes:
-      - ./GidRecBot:/app
+    
+
+# ───────────── Volumes ─────────────
+volumes:
+  postgres_data:
+  redis_data:

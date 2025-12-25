@@ -2,6 +2,8 @@
 import asyncio
 import logging
 from .bot import dp, bot
+from shared.config import config
+
 from .middlewares.logging import LoggingMiddleware
 from .handlers.main_router import router as main_router
 from .handlers.register_router import router as register_router

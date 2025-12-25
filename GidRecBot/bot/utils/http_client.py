@@ -12,7 +12,9 @@ class HTTPClient:
         self.session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        """Инициализирует сессию с base_url = хост (без /api/v1)"""
         if self.session is None or self.session.closed:
+            # ✅ Только хост, без пути — как требует aiohttp
             self.session = aiohttp.ClientSession(base_url=config.API_BASE_URL)
         return self.session
 
@@ -20,14 +22,14 @@ class HTTPClient:
         if self.session and not self.session.closed:
             await self.session.close()
 
-    # 🔑 РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
-    async def register_user(self, tg_id: int, location: str) -> dict:
-        """POST /api/v1/auth/ → создаёт или возвращает пользователя по tg_id"""
+    # 🔑 РЕГИСТРАЦИЯ / ПОЛУЧЕНИЕ ПОЛЬЗОВАТЕЛЯ ПО TG_ID
+    async def register_or_get_user(self, tg_id: int, location: str) -> dict:
+        """POST /api/v1/auth/ — создаёт или возвращает пользователя по tg_id"""
         session = await self._get_session()
         payload = {"tg_id": tg_id, "location": location}
         try:
             async with session.post("/api/v1/auth/", json=payload) as resp:
-                if resp.status == 201:
+                if resp.status in (200, 201):
                     user = await resp.json()
                     user_cache.set(f"user_{tg_id}", user)
                     return user
@@ -35,14 +37,14 @@ class HTTPClient:
                     text = await resp.text()
                     raise Exception(f"HTTP {resp.status}: {text}")
         except Exception as e:
-            logger.error(f"❌ Ошибка регистрации: {e}")
+            logger.error(f"❌ Ошибка регистрации/получения пользователя: {e}")
             raise
 
     # 🔑 ПОЛУЧЕНИЕ ПРОФИЛЯ ПО TG_ID
     async def get_user_by_tg_id(self, tg_id: int) -> dict:
-        """GET /api/v1/auth/by_tg/{tg_id} → профиль пользователя"""
+        """GET /api/v1/auth/by_tg/{tg_id} — профиль пользователя"""
         cached = user_cache.get(f"user_{tg_id}")
-        if cached is not None:
+        if cached:
             return cached
 
         session = await self._get_session()
@@ -60,7 +62,7 @@ class HTTPClient:
 
     # 📝 ОТПРАВКА ОТЗЫВА
     async def create_review(self, tg_id: int, place_id: str, rating: int, text: str) -> dict:
-        """POST /api/v1/reviews/ → отправка отзыва с tg_id в теле"""
+        """POST /api/v1/reviews/ — отзыв с tg_id в теле"""
         session = await self._get_session()
         payload = {
             "tg_id": tg_id,
@@ -81,12 +83,9 @@ class HTTPClient:
 
     # 🤖 РЕКОМЕНДАЦИИ ЧЕРЕЗ LLM
     async def recommend(self, tg_id: int, query: str) -> dict:
-        """POST /api/v1/recommendations/chat → персонализированные рекомендации"""
+        """POST /api/v1/recommendations/chat — естественный язык"""
         session = await self._get_session()
-        payload = {
-            "tg_id": tg_id,
-            "query": query
-        }
+        payload = {"tg_id": tg_id, "query": query}
         try:
             async with session.post("/api/v1/recommendations/chat", json=payload) as resp:
                 if resp.status == 200:
@@ -100,12 +99,9 @@ class HTTPClient:
 
     # 🔍 ПОИСК МЕСТ (для пагинации и natural language)
     async def search_places(self, tg_id: int, query: str) -> dict:
-        """POST /api/v1/recommendations/search → поиск мест по запросу"""
+        """POST /api/v1/recommendations/search — парсинг запроса («концерт в СПб»)"""
         session = await self._get_session()
-        payload = {
-            "tg_id": tg_id,
-            "query": query
-        }
+        payload = {"tg_id": tg_id, "query": query}
         try:
             async with session.post("/api/v1/recommendations/search", json=payload) as resp:
                 if resp.status == 200:
@@ -141,7 +137,6 @@ class HTTPClient:
         payload = {"tg_id": tg_id}
         if notes:
             payload["notes"] = notes
-
         try:
             url = f"/api/v1/moderation/reviews/{review_id}/reject"
             async with session.post(url, json=payload) as resp:
@@ -155,13 +150,14 @@ class HTTPClient:
             raise
 
     # 👮 МОДЕРАЦИЯ: ПОЛУЧЕНИЕ ОЧЕРЕДИ
-    async def get_moderation_queue(self, tg_id: int) -> dict:
-        """GET /api/v1/moderation/queue?tg_id=..."""
+    async def get_moderation_queue(self, tg_id: int) -> list:
+        """GET /api/v1/moderation/pending-reviews (бэкенд не требует tg_id в URL)"""
         session = await self._get_session()
         try:
-            async with session.get(f"/api/v1/moderation/queue?tg_id={tg_id}") as resp:
+            async with session.get("/api/v1/moderation/pending-reviews") as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    data = await resp.json()
+                    return data.get("reviews", [])
                 else:
                     raise Exception(f"HTTP {resp.status}")
         except Exception as e:

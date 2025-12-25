@@ -2,11 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
+# Копируем зависимости ИЗ GidRecBot/
+COPY GidRecBot/requirements.txt .  
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Копируем shared/ из корня
 COPY shared/ ./shared/
-COPY bot/ ./bot/
-COPY __main__.py .
+
+# Копируем код бота
+COPY GidRecBot/bot/ ./bot/
+COPY GidRecBot/bot/__main__.py .
 
 CMD ["python", "-m", "bot"]

@@ -6,8 +6,7 @@ import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-import re
-from ollama import AsyncClient as OllamaCloudClient
+from uuid import UUID, uuid4
 
 # Добавляем путь к src в sys.path
 current_dir = Path(__file__).parent
@@ -32,8 +31,7 @@ from sqlalchemy import (
     ForeignKey, select, update, BigInteger, func
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from uuid import UUID, uuid4
-import uuid
+from ollama import AsyncClient as OllamaCloudClient
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -67,6 +65,8 @@ class Place(Base):
     rating_count = Column(Integer, default=0)
     source = Column(String(50), default="yandex_afisha")
     is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    reviews = relationship("Review", back_populates="place")
 
 class Review(Base):
     __tablename__ = "review"
@@ -77,6 +77,7 @@ class Review(Base):
     text = Column(Text)
     moderation_status = Column(String(20), default="pending")
     moderated_by = Column(PG_UUID(as_uuid=True), ForeignKey("user.id"))
+    moderation_notes = Column(Text, nullable=True)
     llm_check = Column(JSON)
     summary = Column(Text)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
@@ -100,24 +101,31 @@ async def get_db():
 
 # ========== УТИЛИТЫ ==========
 async def update_place_rating(db: AsyncSession, place_id: UUID):
-    result = await db.execute(
-        select(
-            func.avg(Review.rating).label("avg"),
-            func.count(Review.id).label("cnt")
-        ).where(
-            Review.place_id == place_id,
-            Review.moderation_status == "approved"
+    try:
+        result = await db.execute(
+            select(
+                func.avg(Review.rating).label("avg"),
+                func.count(Review.id).label("cnt")
+            ).where(
+                Review.place_id == place_id,
+                Review.moderation_status == "approved"
+            )
         )
-    )
-    avg, cnt = result.one()
-    avg = float(avg) if avg else 0.0
-    cnt = cnt or 0
-    await db.execute(
-        update(Place)
-        .where(Place.id == place_id)
-        .values(rating=avg, rating_count=cnt)
-    )
-    await db.commit()
+        row = result.one()
+        avg, cnt = row.avg, row.cnt
+        
+        avg = float(avg) if avg is not None else 0.0
+        cnt = cnt if cnt is not None else 0
+        
+        await db.execute(
+            update(Place)
+            .where(Place.id == place_id)
+            .values(rating=avg, rating_count=cnt)
+        )
+        # Не делаем коммит здесь, пусть вызывающий код решает
+    except Exception as e:
+        logger.error(f"Error updating place rating: {e}")
+        raise
 
 # ========== OLLAMA CLOUD CLIENT ==========
 class OllamaCloudClientWrapper:
@@ -131,7 +139,6 @@ class OllamaCloudClientWrapper:
         )
         logger.info(f"Ollama Cloud client: {self.model} @ {self.base_url}")
         
-    
     async def test_connection(self) -> bool:
         """Проверяет подключение к Ollama Cloud"""
         try:
@@ -139,8 +146,9 @@ class OllamaCloudClientWrapper:
                 headers = {}
                 if self.api_key:
                     headers['Authorization'] = f'Bearer {self.api_key}'
+                # Используем правильный эндпоинт для Ollama Cloud
                 response = await client.get(
-                    f"{self.base_url}/api/tags",
+                    f"{self.base_url}/api/models",
                     headers=headers
                 )
                 return response.status_code == 200
@@ -148,7 +156,6 @@ class OllamaCloudClientWrapper:
             logger.error(f"Connection test error: {e}")
             return False
     
-
     async def _call_api(self, prompt: str, temperature: float = 0.1) -> Optional[str]:
         try:
             response = await self.client.chat(
@@ -192,9 +199,13 @@ class OllamaCloudClientWrapper:
         response = await self._call_api(prompt, temperature=0.1)
         try:
             if response:
-                return json.loads(response)
-        except:
-            pass
+                data = json.loads(response)
+                if isinstance(data, dict):
+                    return data
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}, response: {response}")
+        except Exception as e:
+            logger.error(f"Error parsing LLM response: {e}")
         return {"is_appropriate": True, "reason": "ошибка LLM", "confidence": 0.5}
 
     async def summarize_review(self, text: str, rating: int) -> str:
@@ -203,13 +214,17 @@ class OllamaCloudClientWrapper:
 
 Суммаризация:"""
         summary = await self._call_api(prompt, temperature=0.2)
-        return (summary or text)[:80]
+        return (summary or text)[:80] if summary else text[:80]
 
     async def generate_recommendations(self, user_prefs: dict, places: list) -> str:
+        if not places:
+            return "К сожалению, сейчас нет доступных мест для рекомендаций."
+        
         places_info = "\n".join([
-            f"- «{p['name']}» ({p['category']}, {p['rating']}★): {p['description'][:80]}"
+            f"- «{p.get('name', 'Без названия')}» ({p.get('category', 'без категории')}, {p.get('rating', 0)}★): {p.get('description', '')[:80]}"
             for p in places[:3]
         ])
+        
         prompt = f"""Ты — дружелюбный гид. Пользователь из {user_prefs.get('city', 'Москвы')} ищет места.
 
 Вот варианты:
@@ -235,17 +250,22 @@ class LLMService:
         if not user:
             return "Пользователь не найден"
 
-        places = await db.execute(select(Place).where(Place.is_active == True).limit(5))
+        places = await db.execute(
+            select(Place)
+            .where(Place.is_active == True, Place.city == user.preferences.get('city', 'Moscow'))
+            .limit(5)
+        )
         places = [
             {
                 "id": p.id,
                 "name": p.name,
                 "category": p.category,
                 "rating": p.rating,
-                "description": p.description
+                "description": p.description or ""
             }
             for p in places.scalars().all()
         ]
+        
         return await self.client.generate_recommendations(
             user.preferences or {"city": "Moscow"},
             places
@@ -253,8 +273,8 @@ class LLMService:
 
 # ========== PYDANTIC MODELS ==========
 class UserCreate(BaseModel):
-    tg_id: int
-    location: str
+    tg_id: int = Field(..., gt=0, description="Telegram ID должен быть положительным числом")
+    location: str = Field(..., min_length=2, max_length=100)
 
 class ReviewCreate(BaseModel):
     place_id: UUID
@@ -262,7 +282,7 @@ class ReviewCreate(BaseModel):
     text: str = Field(..., min_length=10, max_length=500)
 
 class RecommendationRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=2, max_length=200)
 
 class ReviewResponse(BaseModel):
     model_config = {"from_attributes": True}
@@ -273,6 +293,7 @@ class ReviewResponse(BaseModel):
     text: str
     summary: Optional[str] = None
     moderation_status: str
+    moderation_notes: Optional[str] = None
     created_at: datetime
 
 class PlaceResponse(BaseModel):
@@ -315,9 +336,9 @@ async def create_user(user_data: UserCreate, db: AsyncSession = Depends(get_db))
         is_active=True
     )
     db.add(new_user)
-    await db.flush()
-    await db.refresh(new_user)
     await db.commit()
+    await db.refresh(new_user)
+    
     return {
         "id": new_user.id,
         "telegram_id": new_user.telegram_id,
@@ -343,7 +364,7 @@ async def get_user_by_tg_id(tg_id: int, db: AsyncSession = Depends(get_db)):
 @reviews_router.post("/", response_model=ReviewResponse, status_code=201)
 async def create_review(
     review_data: ReviewCreate,
-    tg_id: int = Body(..., embed=True),
+    tg_id: int = Body(..., embed=True, gt=0),
     db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(select(User).where(User.telegram_id == tg_id))
@@ -372,19 +393,28 @@ async def create_review(
         summary=summary,
         moderation_status=moderation_status
     )
-    db.add(new_review)
-    await db.flush()
-    await db.refresh(new_review)
+    
+    try:
+        db.add(new_review)
+        await db.flush()
+        await db.refresh(new_review)
 
-    if should_update_rating:
-        await update_place_rating(db, review_data.place_id)
+        if should_update_rating:
+            await update_place_rating(db, review_data.place_id)
+        
+        await db.commit()
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error creating review: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка при создании отзыва")
 
     return ReviewResponse.model_validate(new_review)
 
 @moderation_router.post("/reviews/{review_id}/approve")
 async def approve_review(
     review_id: UUID,
-    tg_id: int = Body(..., embed=True),
+    tg_id: int = Body(..., embed=True, gt=0),
     db: AsyncSession = Depends(get_db)
 ):
     mod_result = await db.execute(
@@ -402,17 +432,23 @@ async def approve_review(
     if not review:
         raise HTTPException(status_code=404, detail="Отзыв не найден")
 
-    review.moderation_status = "approved"
-    review.moderated_by = moderator.id
-    await db.flush()
-    await update_place_rating(db, review.place_id)
-    await db.commit()
+    try:
+        review.moderation_status = "approved"
+        review.moderated_by = moderator.id
+        await db.flush()
+        await update_place_rating(db, review.place_id)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error approving review: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка при одобрении отзыва")
+    
     return {"success": True, "message": "Отзыв одобрен"}
 
 @moderation_router.post("/reviews/{review_id}/reject")
 async def reject_review(
     review_id: UUID,
-    tg_id: int = Body(..., embed=True),
+    tg_id: int = Body(..., embed=True, gt=0),
     notes: Optional[str] = Body(None, embed=True),
     db: AsyncSession = Depends(get_db)
 ):
@@ -431,21 +467,29 @@ async def reject_review(
     if not review:
         raise HTTPException(status_code=404, detail="Отзыв не найден")
 
-    old_status = review.moderation_status
-    review.moderation_status = "rejected"
-    review.moderated_by = moderator.id
-    review.moderation_notes = notes
+    try:
+        old_status = review.moderation_status
+        review.moderation_status = "rejected"
+        review.moderated_by = moderator.id
+        if notes:
+            review.moderation_notes = notes
 
-    if old_status == "approved":
-        await update_place_rating(db, review.place_id)
+        if old_status == "approved":
+            await update_place_rating(db, review.place_id)
 
-    await db.commit()
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error rejecting review: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка при отклонении отзыва")
+    
     return {"success": True, "message": "Отзыв отклонён"}
 
 @places_router.get("/", response_model=List[PlaceResponse])
 async def get_places(
     category: Optional[str] = None,
     city: Optional[str] = None,
+    min_rating: Optional[float] = Query(None, ge=0, le=5),
     db: AsyncSession = Depends(get_db)
 ):
     query = select(Place).where(Place.is_active == True)
@@ -453,6 +497,9 @@ async def get_places(
         query = query.where(Place.category == category)
     if city:
         query = query.where(Place.city == city)
+    if min_rating is not None:
+        query = query.where(Place.rating >= min_rating)
+    
     result = await db.execute(query)
     return [PlaceResponse.model_validate(p) for p in result.scalars().all()]
 
@@ -467,7 +514,7 @@ async def get_place(place_id: UUID, db: AsyncSession = Depends(get_db)):
 @recommendations_router.post("/chat")
 async def get_chat_recommendations(
     request: RecommendationRequest,
-    tg_id: int = Body(..., embed=True),
+    tg_id: int = Body(..., embed=True, gt=0),
     db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(select(User).where(User.telegram_id == tg_id))
@@ -475,22 +522,30 @@ async def get_chat_recommendations(
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-    places = await db.execute(select(Place).where(Place.is_active == True).limit(5))
-    places = [PlaceResponse.model_validate(p) for p in places.scalars().all()]
+    city = user.preferences.get('city', 'Moscow') if user.preferences else 'Moscow'
+    
+    places = await db.execute(
+        select(Place)
+        .where(Place.is_active == True, Place.city == city)
+        .order_by(Place.rating.desc())
+        .limit(5)
+    )
+    places_data = [PlaceResponse.model_validate(p) for p in places.scalars().all()]
 
     llm_service = LLMService()
-    text = await llm_service.generate_recommendations(user.id, db)
+    recommendations_text = await llm_service.generate_recommendations(user.id, db)
 
     return {
-        "text": text,
-        "places": [p.model_dump() for p in places],
-        "user_id": str(user.id)
+        "text": recommendations_text,
+        "places": [p.model_dump() for p in places_data],
+        "user_id": str(user.id),
+        "city": city
     }
 
 @recommendations_router.post("/search")
 async def search_places(
-    query: str = Body(..., embed=True),
-    tg_id: int = Body(..., embed=True),
+    query: str = Body(..., embed=True, min_length=2, max_length=200),
+    tg_id: int = Body(..., embed=True, gt=0),
     db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(select(User).where(User.telegram_id == tg_id))
@@ -498,25 +553,48 @@ async def search_places(
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-    city = "Moscow"
+    city = user.preferences.get('city', 'Moscow') if user.preferences else 'Moscow'
     category = None
-    if "спб" in query.lower() or "петербург" in query.lower():
+    
+    query_lower = query.lower()
+    if "спб" in query_lower or "петербург" in query_lower or "санкт-петербург" in query_lower:
         city = "Saint Petersburg"
-    if "концерт" in query.lower() or "музык" in query.lower():
+    elif "москв" in query_lower:
+        city = "Moscow"
+    
+    if "концерт" in query_lower or "музык" in query_lower:
         category = "concert"
-    elif "кафе" in query.lower() or "кофе" in query.lower():
+    elif "кафе" in query_lower or "кофе" in query_lower or "ресторан" in query_lower:
         category = "cafe"
+    elif "парк" in query_lower:
+        category = "park"
+    elif "музей" in query_lower or "галере" in query_lower:
+        category = "museum"
+    elif "театр" in query_lower:
+        category = "theater"
 
     query_sql = select(Place).where(Place.city == city, Place.is_active == True)
     if category:
         query_sql = query_sql.where(Place.category == category)
-    result = await db.execute(query_sql.limit(5))
+    
+    result = await db.execute(query_sql.order_by(Place.rating.desc()).limit(5))
     places = [PlaceResponse.model_validate(p).model_dump() for p in result.scalars().all()]
 
-    return {"query": query, "city": city, "category": category, "places": places}
+    return {
+        "query": query, 
+        "city": city, 
+        "category": category, 
+        "places": places,
+        "user_id": str(user.id)
+    }
 
 # ========== СОЗДАНИЕ ПРИЛОЖЕНИЯ ==========
-app = FastAPI(title="Travel Recommendation API", version="1.0.0")
+app = FastAPI(
+    title="Travel Recommendation API",
+    version="1.0.0",
+    description="API для рекомендации мест и управления отзывами"
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -531,7 +609,6 @@ app.include_router(reviews_router, prefix="/api/v1/reviews", tags=["Reviews"])
 app.include_router(moderation_router, prefix="/api/v1/moderation", tags=["Moderation"])
 app.include_router(recommendations_router, prefix="/api/v1/recommendations", tags=["Recommendations"])
 
-
 # ========== СИСТЕМНЫЕ ЭНДПОИНТЫ ==========
 @app.get("/health")
 async def health_check():
@@ -540,8 +617,7 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "service": "travel-recommendation-api",
-        "database": "connected",
-        "llm": "available"  # будет уточнено в /llm-status
+        "version": "1.0.0"
     }
 
 @app.get("/llm-status")
@@ -568,7 +644,6 @@ async def llm_status():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-
 # ========== ТЕСТОВЫЕ ДАННЫЕ ==========
 @app.on_event("startup")
 async def startup_event():
@@ -579,28 +654,82 @@ async def startup_event():
         logger.info("✅ Таблицы созданы")
 
         async with AsyncSessionLocal() as db:
-            users = [
-                User(id=UUID('11111111-1111-1111-1111-111111111111'), telegram_id=123456789, role="user"),
-                User(id=UUID('22222222-2222-2222-2222-222222222222'), telegram_id=987654321, role="moderator")
+            # Создаем тестовых пользователей
+            test_users = [
+                {
+                    "id": UUID('11111111-1111-1111-1111-111111111111'),
+                    "telegram_id": 123456789,
+                    "username": "test_user",
+                    "role": "user",
+                    "preferences": {"city": "Moscow"}
+                },
+                {
+                    "id": UUID('22222222-2222-2222-2222-222222222222'),
+                    "telegram_id": 987654321,
+                    "username": "test_moderator",
+                    "role": "moderator",
+                    "preferences": {"city": "Moscow"}
+                }
             ]
-            for user in users:
-                result = await db.execute(select(User).where(User.telegram_id == user.telegram_id))
+            
+            for user_data in test_users:
+                result = await db.execute(
+                    select(User).where(User.telegram_id == user_data["telegram_id"])
+                )
                 if not result.scalar_one_or_none():
+                    user = User(**user_data)
                     db.add(user)
+            
             await db.commit()
-
-            if not await db.execute(select(Place)).scalars().all():
-                places = [
-                    Place(name="Кофейня у Патриарших", description="Уютное место с домашней выпечкой", category="cafe", city="Moscow", address="Тверская, 12", rating=4.7, created_at=datetime.utcnow()),
-                    Place(name="Парк Горького", description="Зелёная зона с прокатом велосипедов", category="park", city="Moscow", address="Крымский Вал, 9", rating=4.8, created_at=datetime.utcnow())
+            
+            # Проверяем наличие тестовых мест
+            result = await db.execute(select(Place).limit(1))
+            if not result.scalar_one_or_none():
+                test_places = [
+                    Place(
+                        name="Кофейня у Патриарших",
+                        description="Уютное место с домашней выпечкой и кофе из зерен собственной обжарки",
+                        category="cafe",
+                        city="Moscow",
+                        address="Тверская улица, 12",
+                        rating=4.7,
+                        rating_count=128,
+                        price_level=3
+                    ),
+                    Place(
+                        name="Парк Горького",
+                        description="Зелёная зона с прокатом велосипедов, катком и площадками для спорта",
+                        category="park",
+                        city="Moscow",
+                        address="Крымский Вал, 9",
+                        rating=4.8,
+                        rating_count=356,
+                        price_level=1
+                    ),
+                    Place(
+                        name="Государственный Эрмитаж",
+                        description="Один из крупнейших и самых значительных художественных музеев мира",
+                        category="museum",
+                        city="Saint Petersburg",
+                        address="Дворцовая площадь, 2",
+                        rating=4.9,
+                        rating_count=1245,
+                        price_level=3
+                    )
                 ]
-                db.add_all(places)
+                db.add_all(test_places)
                 await db.commit()
                 logger.info("✅ Тестовые данные созданы")
 
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации: {e}")
+        raise
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        reload=False  # В продакшене установить False
+    )
