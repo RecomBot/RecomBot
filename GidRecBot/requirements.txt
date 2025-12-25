@@ -1,2 +1,12 @@
+# Единые зависимости
+python-dotenv==1.0.0
+pydantic==2.9.0
+pydantic-settings==2.1.0
+
+# Telegram-бот
 aiogram==3.13.1
-python-dotenv==1.0.1
+aiohttp==3.9.5
+
+# Для парсера (если запускаете локально)
+sqlalchemy==2.0.23
+asyncpg==0.29.0

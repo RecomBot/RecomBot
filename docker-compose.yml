@@ -1,0 +1,75 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # ───────────── BACKEND ─────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: travel_backend
+    ports:
+      - "8001:8000"  # host:container
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/travel_db
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+    env_file:
+      - .env
+    volumes:
+      - ./backend/src:/app/src
+
+  # ───────────── POSTGRES ─────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: travel_postgres
+    restart: always
+    environment:
+      - POSTGRES_DB=travel_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ───────────── REDIS ─────────────
+  redis:
+    image: redis:7-alpine
+    container_name: travel_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+    # ───────────── TELEGRAM BOT ─────────────
+  bot:
+    build:
+      context: ./GidRecBot
+      dockerfile: Dockerfile.bot
+    container_name: travel_bot
+    depends_on:
+      - backend
+    env_file:
+      - .env
+    volumes:
+      - ./GidRecBot:/app
