@@ -331,26 +331,6 @@ async def cancel_review(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# @router.callback_query(F.data.startswith("place:"))
-# async def show_place_details(callback: CallbackQuery):
-#     place_id = int(callback.data.split(":")[1])
-#     place = MOCK_PLACES.get(place_id)
-#     if not place:
-#         await callback.message.edit_text("❌ Место не найдено.")
-#         await callback.answer()
-#         return
-    
-#     full_stars = int(place["rating_avg"])
-#     half_star = "½" if place["rating_avg"] - full_stars >= 0.5 else ""
-#     stars_text = f"{'⭐' * full_stars}{half_star} {place['rating_avg']:.1f} ({place['rating_count']})"
-    
-#     await callback.message.edit_text(
-#         f"📍 *{place['name']}*\n\n{place['description']}\n\n⭐ {stars_text}\n📌 {place['address']}",
-#         reply_markup=get_place_keyboard(place_id),
-#         parse_mode="Markdown"
-#     )
-#     await callback.answer()
-
 @router.callback_query(F.data.startswith("view_reviews:"))
 async def view_reviews(callback: CallbackQuery):
     """Просмотр отзывов места"""
@@ -456,18 +436,3 @@ async def back_to_place(callback: CallbackQuery):
         await callback.answer("❌ Ошибка загрузки места", show_alert=True)
     
     await callback.answer()
-
-# # 🎯 Обработчик «Назад» (чтобы работал из отзыва)
-# @router.callback_query(F.data == "back_to_main")
-# async def back_to_main_from_review(callback: CallbackQuery):
-#     await callback.message.edit_text(
-#         "✅ Вы вернулись в главное меню.\n\n"
-#         "Напишите, что вам хочется — например:\n"
-#         "• _«Хочу сходить на концерт»_\n"
-#         "• _«Нужно уютное кафе»_\n"
-#         "• _«Что посмотреть в центре?»_\n\n"
-#         "Или воспользуйтесь кнопками ниже:",
-#         parse_mode="Markdown",
-#         reply_markup=MAIN_INLINE_KEYBOARD
-#     )
-#     await callback.answer()

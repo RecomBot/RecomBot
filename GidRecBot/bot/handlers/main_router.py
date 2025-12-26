@@ -19,7 +19,6 @@ async def cmd_help(message: Message):
         parse_mode="Markdown"
     )
 
-# --- /cancel (глобально) ---
 @router.message(Command("cancel", ignore_mention=True))
 @router.message(F.text == "❌ Отмена")
 async def cmd_cancel(message: Message):

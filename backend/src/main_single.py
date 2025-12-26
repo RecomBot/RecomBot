@@ -1424,20 +1424,6 @@ async def create_review(
             )
         )
         existing_review = result.scalar_one_or_none()
-        # Проверяем, есть ли активный отзыв - используем current_user.id
-        # if await has_active_review(db, current_user.id, review_data.place_id):
-        #     latest_review = await get_latest_user_review(db, current_user.id, review_data.place_id)
-            
-        #     if latest_review and latest_review.moderation_status == "rejected":
-        #         raise HTTPException(
-        #             status_code=400, 
-        #             detail=f"Ваш предыдущий отзыв был отклонен. Причина: {latest_review.moderation_notes or 'нарушение правил'}"
-        #         )
-        #     else:
-        #         raise HTTPException(
-        #             status_code=400, 
-        #             detail="У вас уже есть активный отзыв на это место"
-        #         )
 
         if existing_review:
             latest_review = await get_latest_user_review(db, current_user.id, review_data.place_id)

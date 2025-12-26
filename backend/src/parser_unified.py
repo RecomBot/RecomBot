@@ -1,4 +1,4 @@
-# backend/src/parser_unified.py (ИТОГОВЫЙ ИСПРАВЛЕННЫЙ)
+# backend/src/parser_unified.py
 import asyncio
 import re
 import logging
@@ -556,70 +556,3 @@ if __name__ == "__main__":
         asyncio.run(scheduled_parser())
     else:
         asyncio.run(run_parser())
-# # backend/src/parser_unified.py (ОБНОВЛЕННЫЙ)
-# import asyncio
-# import logging
-# from datetime import datetime
-
-# logger = logging.getLogger(__name__)
-
-# async def run_all_parsers():
-#     """Запуск всех парсеров"""
-#     logger.info("=" * 60)
-#     logger.info("🚀 ЗАПУСК ВСЕХ ПАРСЕРОВ")
-#     logger.info("=" * 60)
-    
-#     results = {}
-    
-#     # 1. Запускаем парсер Яндекс.Афиши
-#     try:
-#         from first_yandex_afisha_improved import run_afisha_parser
-#         logger.info("\n🎭 ЗАПУСК ПАРСЕРА ЯНДЕКС.АФИШИ")
-#         results['afisha'] = await run_afisha_parser()
-#     except ImportError as e:
-#         logger.error(f"❌ Не удалось импортировать парсер Яндекс.Афиши: {e}")
-#     except Exception as e:
-#         logger.error(f"❌ Ошибка парсера Яндекс.Афиши: {e}")
-    
-#     # 2. Запускаем парсер Яндекс.Карт
-#     try:
-#         from yandex_maps_parser_with_llm import run_full_llm_parser
-#         logger.info("\n🗺️ ЗАПУСК ПАРСЕРА ЯНДЕКС.КАРТ")
-#         results['maps'] = await run_full_llm_parser()
-#     except ImportError as e:
-#         logger.error(f"❌ Не удалось импортировать парсер Яндекс.Карт: {e}")
-#     except Exception as e:
-#         logger.error(f"❌ Ошибка парсера Яндекс.Карт: {e}")
-    
-#     # Итоговая статистика
-#     logger.info("=" * 60)
-#     logger.info("✅ ВСЕ ПАРСЕРЫ ЗАВЕРШЕНЫ")
-#     logger.info(f"📊 РЕЗУЛЬТАТЫ: {results}")
-#     logger.info("=" * 60)
-
-# # Обновите блок запуска:
-# if __name__ == "__main__":
-#     import argparse
-    
-#     parser = argparse.ArgumentParser(description="Универсальная система парсеров")
-#     parser.add_argument("--afisha", action="store_true", help="Запустить только парсер Яндекс.Афиши")
-#     parser.add_argument("--maps", action="store_true", help="Запустить только парсер Яндекс.Карт")
-#     parser.add_argument("--all", action="store_true", help="Запустить все парсеры")
-#     parser.add_argument("--test", action="store_true", help="Тестовый режим")
-    
-#     args = parser.parse_args()
-    
-#     if args.afisha:
-#         from yandex_afisha_improved import run_improved_afisha_parser
-#         asyncio.run(run_improved_afisha_parser())
-#     elif args.maps:
-#         from yandex_maps_parser_with_llm import run_full_llm_parser
-#         asyncio.run(run_full_llm_parser())
-#     elif args.all:
-#         asyncio.run(run_all_parsers())
-#     elif args.test:
-#         from yandex_afisha_improved import test_parser
-#         asyncio.run(test_parser())
-#     else:
-#         # По умолчанию запускаем все
-#         asyncio.run(run_all_parsers())
