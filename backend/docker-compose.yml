@@ -34,6 +34,12 @@ services:
       - ./env:/app/.env  # Монтируем .env файл если нужно
     command: uvicorn src.main_single:app --host 0.0.0.0 --port 8000 --reload
     # command: ["./entrypoint.sh"]
+    healthcheck:  # ← ДОБАВЬТЕ ЭТО
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   parser:
     build: .
@@ -88,8 +94,40 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    
+  
+  # Telegram Bot
+  telegram-bot:
+    build:
+      context: ../GidRecBot  # путь к папке с ботом
+      dockerfile: ../GidRecBot/Dockerfile.bot
+    container_name: travel_telegram_bot
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Переменные окружения из .env файла бота
+      BOT_TOKEN: "8438052150:AAF6YmhaEyLt7lN0iOb5QZItCby0Jj5Bmz8"
+      API_BASE_URL: http://backend:8000  # внутри Docker сети
+      MODERATOR_TG_ID: 987654321
+      ADMIN_TG_ID: 999999999
+    # env_file:
+      # - ../GidRecBot/.env  # подключаем .env файл бота
+    volumes:
+      # Монтируем логи
+      - telegram_bot_logs:/app/logs
+      # Монтируем код для разработки (опционально)
+      - ../GidRecBot/bot:/app/bot
+      - ../GidRecBot/shared:/app/shared
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://backend:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 # Определяем тома для постоянного хранения данных
 volumes:
   postgres_data:
   redis_data:
+  telegram_bot_logs:

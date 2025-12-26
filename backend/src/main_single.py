@@ -698,6 +698,95 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error generating recommendations: {e}")
             return None
+        
+    async def analyze_search_query(self, query: str, db: AsyncSession) -> Dict[str, Any]:
+        """Анализирует поисковый запрос и определяет критерии поиска"""
+        try:
+            # Получаем все категории из базы данных
+            categories_result = await db.execute(
+                select(Place.category).distinct().where(Place.is_active == True)
+            )
+            available_categories = [c[0] for c in categories_result.all()]
+            
+            # Получаем все города из базы данных
+            cities_result = await db.execute(
+                select(Place.city).distinct().where(Place.is_active == True)
+            )
+            available_cities = [c[0] for c in cities_result.all() if c[0]]
+            
+            # Получаем популярные теги
+            places_result = await db.execute(
+                select(Place.tags).where(Place.is_active == True).limit(50)
+            )
+            all_tags = []
+            for tags in places_result.scalars().all():
+                if tags:
+                    all_tags.extend(tags)
+            
+            popular_tags = list(set(all_tags))[:20]  # Топ 20 тегов
+            
+            prompt = f"""Ты - умный помощник для поиска мест отдыха и развлечений.
+
+    ПОЛЬЗОВАТЕЛЬ ИЩЕТ: "{query}"
+
+    ТВОЯ ЗАДАЧА:
+    1. Определи КАТЕГОРИЮ (выбери одну из доступных)
+    2. Определи ГОРОД (если указан)
+    3. Извлеки КЛЮЧЕВЫЕ СЛОВА для поиска
+    4. Определи ПРИОРИТЕТ сортировки
+
+    ДОСТУПНЫЕ КАТЕГОРИИ: {available_categories}
+    ДОСТУПНЫЕ ГОРОДА: {available_cities}
+    ПОПУЛЯРНЫЕ ТЕГИ: {popular_tags}
+
+    ПРАВИЛА:
+    - Если город не указан, используй "Москва" по умолчанию
+    - Если категория не ясна, выбери наиболее подходящую
+    - Ключевые слова должны быть релевантны запросу
+
+    ПРИМЕРЫ:
+    Запрос: "хочу в уютное кафе с Wi-Fi"
+    Ответ: {{"category": "cafe", "city": "Москва", "keywords": ["уютное", "wi-fi", "кофе", "интернет"], "sort_by": "rating"}}
+
+    Запрос: "романтический ресторан с видом на Москву"
+    Ответ: {{"category": "restaurant", "city": "Москва", "keywords": ["романтический", "вид", "панорамный", "ужин"], "sort_by": "rating"}}
+
+    Запрос: "где погулять в парке сегодня"
+    Ответ: {{"category": "park", "city": "Москва", "keywords": ["прогулка", "природа", "отдых", "зелень"], "sort_by": "reviews"}}
+
+    Запрос: "интересный музей для детей"
+    Ответ: {{"category": "museum", "city": "Москва", "keywords": ["интересный", "дети", "семейный", "образовательный"], "sort_by": "rating"}}
+
+    ВЕРНИ ТОЛЬКО JSON:
+    {{
+        "category": "название категории или null",
+        "city": "город или null",
+        "keywords": ["список", "ключевых", "слов"],
+        "sort_by": "rating|reviews|random",
+        "reasoning": "краткое объяснение почему выбраны такие параметры"
+    }}"""
+            
+            response = await self.client._call_api(prompt, temperature=0.1, max_tokens=500)
+            
+            if not response:
+                return {"category": None, "city": "Москва", "keywords": [], "sort_by": "rating", "reasoning": "LLM не ответил"}
+            
+            # Извлекаем JSON из ответа
+            import re
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                    return result
+                except json.JSONDecodeError:
+                    pass
+            
+            # Если не удалось распарсить JSON
+            return {"category": None, "city": "Москва", "keywords": [], "sort_by": "rating", "reasoning": "Не удалось распарсить ответ LLM"}
+            
+        except Exception as e:
+            logger.error(f"Ошибка анализа запроса: {e}")
+            return {"category": None, "city": "Москва", "keywords": [], "sort_by": "rating", "reasoning": f"Ошибка: {str(e)}"}
 
 # ========== МОДЕЛИ PYDANTIC ==========
 class PlaceCreate(BaseModel):
@@ -763,8 +852,12 @@ class ReviewResponse(BaseModel):
     text: str
     summary: Optional[str] = None
     moderation_status: str
+    moderation_reason: Optional[str] = None
+    llm_check: Optional[Dict[str, Any]] = None
     created_at: str
     helpful_count: int = 0
+    action: Optional[str] = None
+    place_rating_updated: Optional[bool] = None
     
     class Config:
         from_attributes = True
@@ -806,20 +899,51 @@ moderation_router = APIRouter()
 parser_router = APIRouter()
 
 # ========== ЗАВИСИМОСТИ ДЛЯ ПРОВЕРКИ РОЛЕЙ ==========
-async def get_current_user(db: AsyncSession = Depends(get_db)) -> User:
+async def get_current_user(
+    telegram_id: int = Query(..., description="Telegram ID пользователя"),
+    db: AsyncSession = Depends(get_db)
+) -> User:
     """Получение текущего пользователя"""
-    current_user_id = get_current_test_user_id()
-    
-    result = await db.execute(select(User).where(User.id == current_user_id))
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Пользователь заблокирован")
-    
-    return user
+    try:
+        # Ищем пользователя по telegram_id
+        result = await db.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            # Если пользователь не найден, создаем его
+            # (в реальном приложении нужно получать данные из запроса)
+            logger.info(f"Пользователь с telegram_id={telegram_id} не найден, создаем...")
+            
+            # Для тестирования создаем минимального пользователя
+            # В реальном приложении данные должны приходить из запроса
+            new_user = User(
+                telegram_id=telegram_id,
+                username=f"user_{telegram_id}",
+                first_name=f"User_{telegram_id}",
+                role="user",
+                preferences={},
+                is_active=True
+            )
+            
+            db.add(new_user)
+            await db.commit()
+            await db.refresh(new_user)
+            user = new_user
+            logger.info(f"Создан пользователь: telegram_id={telegram_id}, id={user.id}")
+        
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Пользователь заблокирован")
+        
+        # Устанавливаем текущего пользователя для совместимости со старым кодом
+        set_current_test_user_id(user.id)
+        
+        return user
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения пользователя telegram_id={telegram_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 def require_role(allowed_roles: List[str]):
     """Декоратор для проверки ролей"""
@@ -838,6 +962,133 @@ require_admin = require_role(["admin"])
 require_any = require_role(["user", "moderator", "admin"])  # Все авторизованные
 
 # ========== АУТЕНТИФИКАЦИЯ (УПРОЩЕННАЯ) ==========
+class TelegramUserCreate(BaseModel):
+    """Модель для создания пользователя из Telegram"""
+    telegram_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: str = "user"
+
+@auth_router.post("/create-telegram-user")
+async def create_telegram_user(
+    user_data: TelegramUserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Создание/получение пользователя из Telegram"""
+    try:
+        # Проверяем, существует ли пользователь
+        result = await db.execute(
+            select(User).where(User.telegram_id == user_data.telegram_id)
+        )
+        existing_user = result.scalar_one_or_none()
+        
+        if existing_user:
+            # Обновляем существующего пользователя (если информация изменилась)
+            updated = False
+            
+            if user_data.username and existing_user.username != user_data.username:
+                existing_user.username = user_data.username
+                updated = True
+                
+            if user_data.first_name and existing_user.first_name != user_data.first_name:
+                existing_user.first_name = user_data.first_name
+                updated = True
+                
+            if user_data.last_name and existing_user.last_name != user_data.last_name:
+                existing_user.last_name = user_data.last_name
+                updated = True
+                
+            if updated:
+                existing_user.updated_at = func.now()
+                await db.commit()
+                await db.refresh(existing_user)
+                action = "updated"
+            else:
+                action = "exists"
+            
+            logger.info(f"Пользователь {user_data.telegram_id} уже существует")
+        else:
+            # Создаем нового пользователя
+            new_user = User(
+                telegram_id=user_data.telegram_id,
+                username=user_data.username,
+                first_name=user_data.first_name,
+                last_name=user_data.last_name,
+                role=user_data.role,
+                preferences={},
+                is_active=True
+            )
+            
+            db.add(new_user)
+            await db.commit()
+            await db.refresh(new_user)
+            
+            existing_user = new_user
+            action = "created"
+            logger.info(f"Создан новый пользователь: {user_data.telegram_id}")
+        
+        # Формируем ответ
+        return {
+            "id": existing_user.id,
+            "telegram_id": existing_user.telegram_id,
+            "username": existing_user.username,
+            "first_name": existing_user.first_name,
+            "last_name": existing_user.last_name,
+            "role": existing_user.role,
+            "is_active": existing_user.is_active,
+            "action": action,
+            "permissions": {
+                "can_view_places": True,
+                "can_create_reviews": True,
+                "can_get_recommendations": True,
+                "can_moderate": existing_user.role in ["moderator", "admin"]
+            }
+        }
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания пользователя {user_data.telegram_id}: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+@auth_router.get("/telegram-user/{telegram_id}")
+async def get_telegram_user(
+    telegram_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Получение пользователя по telegram_id"""
+    try:
+        result = await db.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        
+        return {
+            "id": user.id,
+            "telegram_id": user.telegram_id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "role": user.role,
+            "is_active": user.is_active,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "permissions": {
+                "can_view_places": True,
+                "can_create_reviews": True,
+                "can_get_recommendations": True,
+                "can_moderate": user.role in ["moderator", "admin"]
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка получения пользователя {telegram_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @auth_router.get("/test-user")
 async def get_test_user_info(
     db: AsyncSession = Depends(get_db)
@@ -1141,11 +1392,20 @@ async def create_place(
 @reviews_router.post("/", response_model=ReviewResponse, status_code=201)
 async def create_review(
     review_data: ReviewCreate,
-    current_user: User = Depends(get_current_user),
+    telegram_id: int = Query(..., description="Telegram ID пользователя"),
     db: AsyncSession = Depends(get_db)
 ):
     """Создание отзыва с LLM проверкой"""
     try:
+        # Получаем пользователя по Telegram ID
+        result = await db.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        current_user = result.scalar_one_or_none()
+        
+        if not current_user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        
         # Проверяем место
         place_result = await db.execute(
             select(Place).where(Place.id == review_data.place_id, Place.is_active == True)
@@ -1155,8 +1415,31 @@ async def create_review(
         if not place:
             raise HTTPException(status_code=404, detail="Место не найдено")
         
+        # Проверяем, есть ли активный отзыв
+        result = await db.execute(
+            select(Review).where(
+                Review.user_id == current_user.id,
+                Review.place_id == review_data.place_id,
+                Review.moderation_status.in_(["approved", "pending", "flagged_by_llm"])
+            )
+        )
+        existing_review = result.scalar_one_or_none()
         # Проверяем, есть ли активный отзыв - используем current_user.id
-        if await has_active_review(db, current_user.id, review_data.place_id):
+        # if await has_active_review(db, current_user.id, review_data.place_id):
+        #     latest_review = await get_latest_user_review(db, current_user.id, review_data.place_id)
+            
+        #     if latest_review and latest_review.moderation_status == "rejected":
+        #         raise HTTPException(
+        #             status_code=400, 
+        #             detail=f"Ваш предыдущий отзыв был отклонен. Причина: {latest_review.moderation_notes or 'нарушение правил'}"
+        #         )
+        #     else:
+        #         raise HTTPException(
+        #             status_code=400, 
+        #             detail="У вас уже есть активный отзыв на это место"
+        #         )
+
+        if existing_review:
             latest_review = await get_latest_user_review(db, current_user.id, review_data.place_id)
             
             if latest_review and latest_review.moderation_status == "rejected":
@@ -1189,7 +1472,7 @@ async def create_review(
             sentiment_score = 0.0  # Негативный отзыв
 
         new_review = Review(
-            user_id=current_user.id,  # ← Используем current_user.id
+            user_id=current_user.id,
             place_id=review_data.place_id,
             rating=review_data.rating,
             text=review_data.text,
@@ -1204,23 +1487,27 @@ async def create_review(
         await db.refresh(new_review)
 
         if should_update_rating:
-            await update_place_rating(db, review_data.place_id)
+            rating_update_result = await update_place_rating(db, review_data.place_id)
             logger.info(f"Отзыв {new_review.id} автоматически одобрен, рейтинг места обновлен")
         else:
             logger.info(f"Отзыв {new_review.id} отправлен на модерацию, рейтинг не изменен")
 
         logger.info(f"Создан отзыв {new_review.id} пользователем {current_user.username}, статус: {moderation_status}")
-        return ReviewResponse(
-            id=new_review.id,
-            user_id=new_review.user_id,
-            place_id=new_review.place_id,
-            rating=new_review.rating,
-            text=new_review.text,
-            summary=new_review.summary,
-            moderation_status=new_review.moderation_status,
-            created_at=new_review.created_at.isoformat(),
-            helpful_count=new_review.helpful_count
-        )
+        return {
+            "id": new_review.id,
+            "user_id": new_review.user_id,
+            "place_id": new_review.place_id,
+            "rating": new_review.rating,
+            "text": new_review.text,
+            "summary": new_review.summary,
+            "moderation_status": new_review.moderation_status,
+            "moderation_reason": llm_check.get("reason") if not llm_check.get("is_appropriate", True) else None,
+            "llm_check": llm_check,
+            "created_at": new_review.created_at.isoformat() if new_review.created_at else None,
+            "helpful_count": new_review.helpful_count,
+            "action": "created",
+            "place_rating_updated": should_update_rating
+        }
         
     except HTTPException:
         raise
@@ -1330,20 +1617,130 @@ async def get_user_review_for_place(
     except Exception as e:
         logger.error(f"Ошибка получения отзывов пользователя: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-@reviews_router.delete("/{review_id}")
-async def delete_review(
-    review_id: UUIDType,
-    current_user: User = Depends(require_moderator),
+
+# В main_single.py в reviews_router добавить:
+
+class UserReviewResponse(BaseModel):
+    """Модель для ответа с отзывом пользователя"""
+    id: UUIDType
+    place_id: UUIDType
+    place_name: str
+    rating: int
+    text: str
+    summary: Optional[str] = None
+    moderation_status: str
+    moderation_reason: Optional[str] = None
+    created_at: str
+    helpful_count: int = 0
+    can_edit: bool = Field(default=False, description="Можно ли редактировать отзыв")
+    can_delete: bool = Field(default=True, description="Можно ли удалить отзыв")
+
+@reviews_router.get("/user/{telegram_id}/reviews")
+async def get_user_reviews(
+    telegram_id: int,
+    status: Optional[str] = Query(None, description="Фильтр по статусу (approved, pending, rejected, flagged_by_llm)"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db)
 ):
-    """Удаление отзыва (с обновлением рейтинга места)"""
+    """Получение отзывов пользователя по telegram_id"""
     try:
-        # Получаем отзыв
-        result = await db.execute(
-            select(Review).where(Review.id == review_id)
+        # Получаем пользователя по telegram_id
+        user_result = await db.execute(
+            select(User).where(User.telegram_id == telegram_id)
         )
-        review = result.scalar_one_or_none()
+        user = user_result.scalar_one_or_none()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        
+        # Строим базовый запрос
+        query = select(Review).where(Review.user_id == user.id)
+        
+        # Фильтруем по статусу если указан
+        if status:
+            query = query.where(Review.moderation_status == status)
+        
+        # Получаем общее количество для пагинации
+        count_query = select(func.count(Review.id)).where(Review.user_id == user.id)
+        if status:
+            count_query = count_query.where(Review.moderation_status == status)
+        
+        count_result = await db.execute(count_query)
+        total_count = count_result.scalar() or 0
+        
+        # Получаем отзывы с пагинацией
+        query = query.order_by(Review.created_at.desc()).offset(offset).limit(limit)
+        result = await db.execute(query)
+        reviews = result.scalars().all()
+        
+        # Собираем ответ с информацией о местах
+        user_reviews = []
+        for review in reviews:
+            # Получаем информацию о месте
+            place_result = await db.execute(
+                select(Place.name).where(Place.id == review.place_id)
+            )
+            place_name = place_result.scalar_one_or_none() or "Неизвестное место"
+            
+            # Определяем можно ли редактировать/удалять отзыв
+            can_edit = review.moderation_status in ["pending", "flagged_by_llm"]
+            can_delete = True  # Можно удалить всегда
+            
+            user_reviews.append({
+                "id": review.id,
+                "place_id": review.place_id,
+                "place_name": place_name,
+                "rating": review.rating,
+                "text": review.text,
+                "summary": review.summary,
+                "moderation_status": review.moderation_status,
+                "moderation_reason": review.moderation_notes,
+                "created_at": review.created_at.isoformat() if review.created_at else None,
+                "helpful_count": review.helpful_count,
+                "can_edit": can_edit,
+                "can_delete": can_delete
+            })
+        
+        return {
+            "reviews": user_reviews,
+            "total": total_count,
+            "limit": limit,
+            "offset": offset,
+            "has_more": (offset + len(reviews)) < total_count
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка получения отзывов пользователя {telegram_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@reviews_router.delete("/{review_id}")
+async def delete_user_review(
+    review_id: UUIDType,
+    telegram_id: int = Query(..., description="Telegram ID пользователя"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Удаление отзыва пользователя"""
+    try:
+        # Получаем пользователя
+        user_result = await db.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        
+        # Получаем отзыв
+        review_result = await db.execute(
+            select(Review).where(
+                Review.id == review_id,
+                Review.user_id == user.id
+            )
+        )
+        review = review_result.scalar_one_or_none()
         
         if not review:
             raise HTTPException(status_code=404, detail="Отзыв не найден")
@@ -1363,18 +1760,38 @@ async def delete_review(
         return {
             "success": True,
             "message": "Отзыв удален",
-            "place_id": place_id,
-            "deleted_by": current_user.username,
-            "user_role": current_user.role
+            "review_id": str(review_id),
+            "place_id": str(place_id)
         }
         
     except HTTPException:
         raise
     except Exception as e:
         await db.rollback()
-        logger.error(f"Ошибка удаления отзыва: {e}")
+        logger.error(f"Ошибка удаления отзыва {review_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+class ModerationNotification(BaseModel):
+    """Модель для уведомления о модерации"""
+    review_id: UUIDType
+    telegram_id: int
+    new_status: str
+    reason: Optional[str] = None
+
+@reviews_router.post("/notify-moderation")
+async def notify_moderation_result(
+    notification: ModerationNotification,
+    db: AsyncSession = Depends(get_db)
+):
+    """Получение уведомления от бекенда о результате модерации"""
+    # Здесь будет логика отправки уведомления в телеграм
+    # Пока просто логируем
+    logger.info(f"Уведомление о модерации: review_id={notification.review_id}, "
+                f"telegram_id={notification.telegram_id}, status={notification.new_status}")
     
+    # В будущем здесь будет вызов API телеграм бота
+    return {"status": "notification_received"}
+
 # ========== МОДЕРАЦИЯ ==========
 @moderation_router.get("/pending-reviews")
 async def get_pending_reviews(
@@ -1416,11 +1833,22 @@ async def get_pending_reviews(
 @moderation_router.post("/reviews/{review_id}/approve")
 async def approve_review(
     review_id: UUIDType,
-    current_user: User = Depends(require_moderator),
+    telegram_id: int = Query(..., description="Telegram ID модератора"),
     db: AsyncSession = Depends(get_db)
 ):
     """Одобрение отзыва"""
     try:
+        # Получаем модератора по Telegram ID
+        moderator_result = await db.execute(
+            select(User).where(
+                User.telegram_id == telegram_id,
+                User.role.in_(["moderator", "admin"])
+            )
+        )
+        current_user = moderator_result.scalar_one_or_none()
+        
+        if not current_user:
+            raise HTTPException(status_code=403, detail="Доступ запрещен. Требуется роль модератора или администратора")
         
         # Проверяем что пользователь - модератор или админ
         user_result = await db.execute(
@@ -1447,8 +1875,17 @@ async def approve_review(
         review.moderated_at = func.now()
         
         await update_place_rating(db, review.place_id)
-
         await db.commit()
+
+        user_result = await db.execute(
+            select(User).where(User.id == review.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if user and user.telegram_id:
+            logger.info(f"Отзыв {review_id} одобрен. Нужно уведомить пользователя {user.telegram_id}")
+            # Здесь будет вызов к боту
+            
         return {"success": True, "message": "Отзыв одобрен", "moderator_id": current_user.id}
         
     except HTTPException:
@@ -1490,6 +1927,18 @@ async def reject_review(
             logger.info(f"Отзыв {review_id} отклонен (был в статусе {old_status})")
 
         await db.commit()
+
+        # TODO: Отправить уведомление пользователю через бота
+        # Нужно получить telegram_id пользователя
+        user_result = await db.execute(
+            select(User).where(User.id == review.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if user and user.telegram_id:
+            logger.info(f"Отзыв {review_id} отклонен. Нужно уведомить пользователя {user.telegram_id}")
+            # Здесь будет вызов к боту
+
         return {
             "success": True, 
             "message": "Отзыв отклонен",
@@ -1584,6 +2033,119 @@ async def get_personal_recommendations(
         logger.error(f"Ошибка получения рекомендаций: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+class IntelligentSearchRequest(BaseModel):
+    """Модель для интеллектуального поиска"""
+    query: str
+    telegram_id: Optional[int] = None
+    limit: int = 10
+
+@recommendations_router.post("/intelligent-search")
+async def intelligent_search(
+    request: IntelligentSearchRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Интеллектуальный поиск мест с использованием LLM"""
+    try:
+        llm_service = LLMService()
+        
+        # 1. Анализируем запрос с помощью LLM
+        analysis = await llm_service.analyze_search_query(request.query, db)
+        
+        logger.info(f"LLM анализ запроса '{request.query}': {analysis}")
+        
+        # 2. Строим запрос к базе данных на основе анализа
+        query_builder = select(Place).where(Place.is_active == True)
+        
+        # Фильтр по категории
+        if analysis.get("category"):
+            query_builder = query_builder.where(Place.category == analysis["category"])
+        
+        # Фильтр по городу
+        city = analysis.get("city", "Москва")
+        query_builder = query_builder.where(Place.city == city)
+        
+        # Получаем все места для фильтрации по ключевым словам
+        result = await db.execute(query_builder.limit(100))
+        all_places = result.scalars().all()
+        
+        # 3. Фильтруем места по ключевым словам
+        keywords = analysis.get("keywords", [])
+        filtered_places = []
+        
+        for place in all_places:
+            if not place:
+                continue
+            
+            # Создаем текст для поиска ключевых слов
+            search_text = f"{place.name} {place.description or ''} {' '.join(place.tags or [])}".lower()
+            
+            # Проверяем наличие ключевых слов
+            keyword_matches = 0
+            for keyword in keywords:
+                if keyword.lower() in search_text:
+                    keyword_matches += 1
+            
+            # Если есть совпадения или ключевых слов нет, включаем место
+            if keyword_matches > 0 or not keywords:
+                # Добавляем информацию о совпадениях
+                place_dict = {
+                    "id": place.id,
+                    "name": place.name,
+                    "description": place.description,
+                    "category": place.category,
+                    "city": place.city,
+                    "address": place.address,
+                    "price_level": place.price_level,
+                    "tags": place.tags,
+                    "rating": place.rating,
+                    "review_count": await get_place_review_count(db, place.id),
+                    "keyword_matches": keyword_matches
+                }
+                filtered_places.append(place_dict)
+        
+        # 4. Сортируем результаты
+        sort_by = analysis.get("sort_by", "rating")
+        if sort_by == "reviews":
+            filtered_places.sort(key=lambda x: (x.get("review_count", 0), x.get("rating", 0)), reverse=True)
+        elif sort_by == "random":
+            import random
+            random.shuffle(filtered_places)
+        else:  # rating
+            filtered_places.sort(key=lambda x: (x.get("rating", 0), x.get("review_count", 0)), reverse=True)
+        
+        # 5. Ограничиваем количество результатов
+        places_to_return = filtered_places[:request.limit]
+        
+        # 6. Формируем ответ
+        response = {
+            "success": True,
+            "query": request.query,
+            "analysis": analysis,
+            "places": places_to_return,
+            "total_found": len(filtered_places),
+            "total_shown": len(places_to_return),
+            "source": "intelligent_search"
+        }
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Ошибка интеллектуального поиска: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def get_place_review_count(db: AsyncSession, place_id: UUID) -> int:
+    """Получает количество одобренных отзывов для места"""
+    try:
+        result = await db.execute(
+            select(func.count(Review.id)).where(
+                Review.place_id == place_id,
+                Review.moderation_status == "approved"
+            )
+        )
+        return result.scalar() or 0
+    except:
+        return 0
+    
 @recommendations_router.post("/chat")
 async def get_chat_recommendations(
     request: RecommendationRequest,
