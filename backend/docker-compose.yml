@@ -1,61 +1,47 @@
 # backend/docker-compose.yml
 services:
-  # Сервис вашего FastAPI-приложения
   backend:
     build: .
     container_name: travel_backend
     ports:
-      - "8001:8000"  # Пробрасываем порт 8000 из контейнера на локальную машину
+      - "8000:8000"
     depends_on:
       postgres:
-        condition: service_healthy  # ← Ждем пока БД не будет готова
+        condition: service_healthy
       redis:
         condition: service_started
     environment:
-      # Переменные окружения, которые будут переданы в контейнер
-      # Их значения мы возьмем из файла .env (создадим его ниже)
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       JWT_ALGORITHM: ${JWT_ALGORITHM}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
-      # LLM ключи
-      # OLLAMA_CLOUD_HOST: ${OLLAMA_CLOUD_HOST}
-      # OLLAMA_CLOUD_MODEL: ${OLLAMA_CLOUD_MODEL}
       OLLAMA_API_KEY: ${OLLAMA_API_KEY}
-      # OLLAMA_BASE_URL: http://host.docker.internal:11434/api
-    # extra_hosts:  # Это важно для корректного разрешения адреса
-    #   - "host.docker.internal:host-gateway"
     env_file:
-      - .env  # Загружаем переменные из .env файла
+      - .env
     volumes:
-      # Монтируем папку с кодом, чтобы изменения сразу применялись
       - ./src:/app/src
-      - ./env:/app/.env  # Монтируем .env файл если нужно
-    command: uvicorn src.main_single:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 
-  # Сервис базы данных PostgreSQL
   postgres:
     image: postgres:15-alpine
     container_name: travel_postgres
     restart: always
     environment:
-      POSTGRES_DB: travel_db        # Имя БД, которое создастся при старте
-      POSTGRES_USER: postgres       # Пользователь БД
-      POSTGRES_PASSWORD: postgres  # Пароль пользователя
+      POSTGRES_DB: travel_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"  # Проброс порта для подключения извне (например, из DBeaver)
+      - "5432:5432"
     volumes:
-      # Постоянное хранилище для данных БД, чтобы они не пропадали при перезапуске
       - postgres_data:/var/lib/postgresql/data
-    healthcheck:  # ← ДОБАВЬТЕ ЭТО
+    healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
 
-  # Сервис кэша Redis
   redis:
     image: redis:7-alpine
     container_name: travel_redis
@@ -65,7 +51,6 @@ services:
     volumes:
       - redis_data:/data
 
-# Определяем тома для постоянного хранения данных
 volumes:
   postgres_data:
   redis_data:
