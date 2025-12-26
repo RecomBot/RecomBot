@@ -1,0 +1,64 @@
+# docker-compose.prod.yml
+version: '3.8'
+
+services:
+  backend:
+    environment:
+      RELOAD: "false"
+      DEBUG: "false"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  bot:
+    environment:
+      DEBUG: "false"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  postgres:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  redis:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # В продакшене парсер не нужен постоянно
+  parser:
+    restart: "no"
+    profiles: ["parser"]
+
+  # В продакшене админские интерфейсы отключаем
+  adminer:
+    profiles: ["admin"]
+    
+  redis-commander:
+    profiles: ["admin"]

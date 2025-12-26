@@ -1,16 +1,30 @@
+# GidRecBot/Dockerfile.bot
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Копируем зависимости ИЗ GidRecBot/
-COPY GidRecBot/requirements.txt .  
+# Устанавливаем системные зависимости
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем зависимости
+COPY GidRecBot/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем shared/ из корня
+# Копируем shared модули
 COPY shared/ ./shared/
 
 # Копируем код бота
 COPY GidRecBot/bot/ ./bot/
-COPY GidRecBot/bot/__main__.py .
 
-CMD ["python", "-m", "bot"]
+# Создаем точку входа
+RUN echo '#!/usr/bin/env python3\nfrom bot.__main__ import main\nimport asyncio\nasyncio.run(main())' > /app/run_bot.py
+RUN chmod +x /app/run_bot.py
+
+# Создаем пользователя для безопасности
+RUN useradd -m -u 1001 botuser && chown -R botuser:botuser /app
+USER botuser
+
+# Команда запуска
+CMD ["python", "/app/run_bot.py"]

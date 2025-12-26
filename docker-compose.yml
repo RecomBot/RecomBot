@@ -1,4 +1,4 @@
-# docker-compose.yml — корень проекта RecomBot/
+# docker-compose.yml - корень проекта RecomBot/
 version: '3.8'
 
 services:
@@ -6,69 +6,178 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: travel_postgres
-    restart: always
+    restart: unless-stopped
     environment:
-      - POSTGRES_DB=travel_db
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      POSTGRES_DB: travel_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     ports:
-      - "5433:5432"
+      - "5432:5432"  # Локально доступен на стандартном порту
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
+    networks:
+      - travel_network
 
   # ───────────── Redis ─────────────
   redis:
     image: redis:7-alpine
     container_name: travel_redis
-    restart: always
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    command: redis-server --appendonly yes
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - travel_network
 
   # ───────────── Backend (FastAPI) ─────────────
   backend:
     build:
-      context: .                     # ← контекст — корень проекта
+      context: .
       dockerfile: backend/Dockerfile
     container_name: travel_backend
+    restart: unless-stopped
     ports:
-      - "8001:8000"                 # host:container
+      - "8000:8000"  # Локально: http://localhost:8000
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
+    environment:
+      # Основные переменные (берутся из .env)
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/travel_db
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      # Для разработки
+      DEBUG: ${DEBUG:-false}
+      RELOAD: ${RELOAD:-false}
     env_file:
       - .env
     volumes:
-      # Только для hot-reload в dev (не для продакшена!)
+      # Hot-reload для разработки
       - ./backend/src:/app/src
+      - ./shared:/app/shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - travel_network
+    command: >
+      sh -c "if [ \"$$RELOAD\" = 'true' ]; then
+        uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload;
+      else
+        uvicorn src.main:app --host 0.0.0.0 --port 8000;
+      fi"
 
-  # ───────────── Telegram Bot (aiogram) ─────────────
+  # ───────────── Telegram Bot ─────────────
   bot:
     build:
-      context: .                     # ← контекст — корень проекта
+      context: .
       dockerfile: GidRecBot/Dockerfile.bot
     container_name: travel_bot
+    restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      API_BASE_URL: http://backend:8000/api/v1  # Внутри Docker сети
+      DEBUG: ${DEBUG:-false}
     env_file:
       - .env
-    
+    volumes:
+      # Для hot-reload в разработке
+      - ./GidRecBot/bot:/app/bot
+      - ./shared:/app/shared
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f python || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - travel_network
 
-# ───────────── Volumes ─────────────
+  # ───────────── Парсер (опционально) ─────────────
+  parser:
+    build:
+      context: .
+      dockerfile: parser/Dockerfile
+    container_name: travel_parser
+    restart: "no"  # Запускаем только когда нужно
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/travel_db
+      PARSE_CITY: ${PARSE_CITY:-Moscow}
+      MAX_PAGES_PER_CATEGORY: ${MAX_PAGES_PER_CATEGORY:-3}
+      REQUEST_DELAY: ${REQUEST_DELAY:-2.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    env_file:
+      - .env
+    volumes:
+      - ./parser:/app
+      - ./shared:/app/shared
+    networks:
+      - travel_network
+    command: python parser.py
+
+  # ───────────── Adminer (веб-интерфейс для БД) ─────────────
+  adminer:
+    image: adminer:latest
+    container_name: travel_adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    networks:
+      - travel_network
+
+  # ───────────── Redis Commander (веб-интерфейс для Redis) ─────────────
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: travel_redis_commander
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    networks:
+      - travel_network
+
+# ───────────── Сети и тома ─────────────
+networks:
+  travel_network:
+    driver: bridge
+    name: travel_network
+
 volumes:
   postgres_data:
+    name: travel_postgres_data
   redis_data:
+    name: travel_redis_data

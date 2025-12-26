@@ -1,38 +1,61 @@
-# bot/__main__.py
+# GidRecBot/bot/__main__.py - добавить проверку перед запуском
 import asyncio
 import logging
 from .bot import dp, bot
-from shared.config import config
-
-from .middlewares.logging import LoggingMiddleware
-from .handlers.main_router import router as main_router
-from .handlers.register_router import router as register_router
-from .handlers.llm_router import router as llm_router          
-from .handlers.review_router import router as review_router
-from .handlers.fallback_router import router as fallback_router
-from .handlers.moderation_router import router as moderation_router
 from .utils.http_client import http_client
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-logging.info("🔌 Подключаем middleware и роутеры")
-dp.message.middleware(LoggingMiddleware())
-
-
-dp.include_router(main_router)
-dp.include_router(register_router)
-dp.include_router(llm_router)         
-dp.include_router(review_router)
-dp.include_router(moderation_router) 
-dp.include_router(fallback_router)
+async def check_api_connection():
+    """Проверка подключения к API перед запуском бота"""
+    logger.info("🔌 Проверка подключения к API...")
+    
+    max_retries = 5
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            # Пробуем получить health status
+            is_healthy = await http_client.check_api_health()
+            if is_healthy:
+                logger.info("✅ API доступен!")
+                return True
+            else:
+                logger.warning(f"⚠️ API не здоров. Попытка {attempt + 1}/{max_retries}")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось подключиться к API. Попытка {attempt + 1}/{max_retries}: {e}")
+        
+        if attempt < max_retries - 1:
+            logger.info(f"⏳ Ожидание {retry_delay} секунд перед повторной попыткой...")
+            await asyncio.sleep(retry_delay)
+    
+    logger.error("❌ Не удалось подключиться к API после всех попыток")
+    return False
 
 async def main():
     logging.info("🚀 Бот запускается...")
+    
+    # Проверяем подключение к API
+    if not await check_api_connection():
+        logger.error("❌ Бот не может запуститься без подключения к API")
+        await http_client.close()
+        sys.exit(1)
+    
+    # Проверяем LLM статус
+    try:
+        llm_status = await http_client.llm_status()
+        logger.info(f"🤖 LLM статус: {llm_status.get('status', 'unknown')}")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось проверить LLM статус: {e}")
+    
     try:
         await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"❌ Ошибка в боте: {e}")
     finally:
         await http_client.close()
 

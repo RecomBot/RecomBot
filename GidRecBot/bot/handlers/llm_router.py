@@ -12,46 +12,74 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 
-async def show_places_page(message: Message, state: FSMContext):
-    """Показывает страницу мест (3 за раз)"""
+async def show_places_page(message: Message, state: FSMContext, new_search: bool = False):
+    """Показать страницу мест (3 за раз)"""
     data = await state.get_data()
     places = data.get("places", [])
     offset = data.get("offset", 0)
     query = data.get("query", "")
     location = data.get("location", "Moscow")
-
+    
     page_places = places[offset:offset + 3]
     if not page_places:
-        await message.answer("🔚 Больше нет рекомендаций.")
-        await state.clear()
+        await message.answer("🔚 *Больше нет рекомендаций.*", parse_mode="Markdown")
+        if new_search:
+            await state.clear()
         return
-
-    for place in page_places:
+    
+    # Показываем места
+    for idx, place in enumerate(page_places, 1):
+        place_id = place.get("id", "")
         rating = place.get("rating", 0.0)
         count = place.get("rating_count", 0)
+        price_level = place.get("price_level", 2)
+        
+        # Форматируем рейтинг
         stars = "⭐" * int(rating) + ("½" if rating % 1 >= 0.5 else "")
         stars_text = f"{stars} {rating:.1f} ({count})"
-
-        await message.answer(
-            f"📍 *{place['name']}*\n"
-            f"{place.get('description', '')}\n"
+        
+        # Форматируем уровень цен
+        price_display = "💲" * price_level
+        
+        # Формируем сообщение
+        place_text = (
+            f"📍 *{place['name']}*\n\n"
+            f"{place.get('description', '')[:100]}...\n\n"
             f"⭐ {stars_text}\n"
-            f"📌 {place.get('address', 'Адрес не указан')}",
-            reply_markup=get_place_keyboard(place["id"]),
+            f"🏷️ {place.get('category', 'без категории')}\n"
+            f"💰 {price_display}\n"
+            f"📌 {place.get('address', 'Адрес не указан')[:50]}"
+        )
+        
+        await message.answer(
+            place_text,
+            reply_markup=get_place_keyboard(place_id),
             parse_mode="Markdown"
         )
-
+    
     # Пагинация
     buttons = []
     if offset > 0:
         buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="page:prev"))
     if offset + 3 < len(places):
         buttons.append(InlineKeyboardButton(text="➡️ Ещё", callback_data="page:next"))
-
+    
     if buttons:
         await message.answer(
-            f"📍 Рекомендации для *{location}* по запросу:\n_«{query}»_",
+            f"📍 *Рекомендации для {location}*\n"
+            f"🔍 *Запрос:* «{query}»\n"
+            f"📋 *Найдено мест:* {len(places)}\n"
+            f"📄 *Страница:* {offset//3 + 1}/{(len(places) + 2)//3}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]),
+            parse_mode="Markdown"
+        )
+    
+    if new_search:
+        await message.answer(
+            "💡 *Что дальше?*\n"
+            "• Нажмите на кнопку '✍️ Оставить отзыв' под понравившимся местом\n"
+            "• Напишите новый запрос для поиска\n"
+            "• Используйте кнопки пагинации для просмотра других мест",
             parse_mode="Markdown"
         )
 
@@ -62,122 +90,127 @@ async def show_places_page(message: Message, state: FSMContext):
     StateFilter(default_state)  # ← Только если НЕ в FSM (не в отзыве)
 )
 async def handle_natural_query(message: Message, state: FSMContext):
+    """Обработка естественного языка запроса"""
     text = message.text.strip()
+    
+    # Игнорируем команды и кнопки
     if text.startswith("/") or text in ["🎯 Получить рекомендацию", "❓ Помощь", "⏹ Отмена"]:
         return
-
-    temp_msg = await message.answer("🧠 *Анализирую запрос...*", parse_mode="Markdown")
-
+    
+    temp_msg = await message.answer("🧠 *Анализирую ваш запрос...*", parse_mode="Markdown")
+    
     try:
-        # Получаем пользователя (регистрируем, если нужно)
-        user = await http_client.get_user_by_tg_id(message.from_user.id)
+        # 1. Получаем или регистрируем пользователя
+        try:
+            user = await http_client.get_user_by_tg_id(message.from_user.id)
+        except:
+            # Пользователь не найден, предлагаем зарегистрироваться
+            await temp_msg.delete()
+            await message.answer(
+                "👋 *Добро пожаловать!*\n\n"
+                "Похоже, вы здесь впервые. Пожалуйста, выполните команду `/start` "
+                "для регистрации и выбора города.",
+                parse_mode="Markdown"
+            )
+            return
+        
         location = user.get("preferences", {}).get("city", "Moscow")
-
-        # Выполняем поиск или LLM-рекомендацию
-        if "хочу" in text.lower() or "нужно" in text.lower() or "ищу" in text.lower():
-            # Natural language → LLM
+        username = message.from_user.username or message.from_user.first_name or "Пользователь"
+        
+        # 2. Определяем тип запроса и получаем рекомендации
+        if any(word in text.lower() for word in ["хочу", "нужно", "ищу", "посоветуй", "рекомендуй", "где"]):
+            # Natural language → LLM рекомендации
             response = await http_client.recommend(
                 tg_id=message.from_user.id,
-                query=text
+                query=text,
+                limit=10
             )
+            recommendation_text = response.get("text", "")
+            places = response.get("places", [])
         else:
-            # Простой поиск → /search
+            # Простой поиск
             response = await http_client.search_places(
                 tg_id=message.from_user.id,
-                query=text
+                query=text,
+                limit=10
             )
-
-        # Сохраняем в состояние
+            recommendation_text = response.get("text", f"Результаты поиска по запросу «{text}»")
+            places = response.get("places", [])
+        
+        await temp_msg.delete()
+        
+        if not places:
+            await message.answer(
+                f"❌ *По вашему запросу ничего не найдено.*\n\n"
+                f"Попробуйте:\n"
+                f"• Уточнить запрос (например, «кофе в центре»)\n"
+                f"• Изменить город (сейчас: {location})\n"
+                f"• Использовать другие ключевые слова",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # 3. Показываем LLM рекомендацию (если есть)
+        if recommendation_text and len(recommendation_text) > 20:
+            await message.answer(
+                f"💬 *Рекомендация для {username}:*\n\n{recommendation_text}",
+                parse_mode="Markdown"
+            )
+        
+        # 4. Сохраняем в состояние для пагинации
         await state.update_data(
-            places=response.get("places", []),
+            places=places,
             query=text,
             offset=0,
             location=location
         )
-
-        await temp_msg.delete()
-        await message.answer(
-            f"✅ *Вот что подойдёт вам в {location}:*",
-            parse_mode="Markdown"
-        )
-        await show_places_page(message, state)
-
+        
+        # 5. Показываем первую страницу
+        await show_places_page(message, state, new_search=True)
+        
     except Exception as e:
-        logger.exception("❌ Ошибка обработки запроса")
-        await temp_msg.edit_text(
-            "❌ Не удалось обработать запрос. Попробуйте переформулировать.",
-            parse_mode="Markdown"
-        )
+        await temp_msg.delete()
+        logger.exception(f"❌ Ошибка обработки запроса: {e}")
+        
+        error_msg = str(e)
+        if "API error" in error_msg:
+            await message.answer(
+                "❌ *Сервис рекомендаций временно недоступен.*\n\n"
+                "Попробуйте позже или используйте простой поиск.",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer(
+                f"❌ *Не удалось обработать запрос:*\n`{error_msg[:100]}`\n\n"
+                "Попробуйте переформулировать запрос или обратитесь в поддержку.",
+                parse_mode="Markdown"
+            )
 
 
 # 📖 Пагинация: Назад
 @router.callback_query(F.data == "page:prev")
 async def page_prev(callback: CallbackQuery, state: FSMContext):
+    """Предыдущая страница"""
     data = await state.get_data()
     data["offset"] = max(0, data["offset"] - 3)
     await state.update_data(offset=data["offset"])
+    
     await callback.message.delete()
     await show_places_page(callback.message, state)
-    await callback.answer()
+    await callback.answer("⬅️ Предыдущая страница")
 
 
 # 📖 Пагинация: Ещё
 @router.callback_query(F.data == "page:next")
 async def page_next(callback: CallbackQuery, state: FSMContext):
+    """Следующая страница"""
     data = await state.get_data()
     data["offset"] += 3
     await state.update_data(offset=data["offset"])
+    
     await callback.message.delete()
     await show_places_page(callback.message, state)
-    await callback.answer()
+    await callback.answer("➡️ Следующая страница")
 
 
-# ℹ️ Кнопка «Подробнее» (place:123)
-@router.callback_query(F.data.startswith("place:"))
-async def show_place_details(callback: CallbackQuery):
-    place_id = callback.data.split(":")[1]
-
-    # Запросим детали из бэкенда (если нужно) или покажем из кэша
-    # Пока используем mock (в продакшене — GET /api/v1/places/{id})
-    MOCK_PLACES = {
-        "1": {
-            "name": "Кофейня у Патриарших",
-            "description": "Уютное место с домашней выпечкой и ароматным кофе.",
-            "rating": 4.7,
-            "rating_count": 23,
-            "address": "Тверская, 12"
-        },
-        "2": {
-            "name": "Музей современного искусства",
-            "description": "Интерактивные выставки и лекции от художников.",
-            "rating": 4.5,
-            "rating_count": 41,
-            "address": "Петровка, 25"
-        },
-        "3": {
-            "name": "Парк Горького",
-            "description": "Зелёная зона с прокатом велосипедов и летней верандой.",
-            "rating": 4.8,
-            "rating_count": 156,
-            "address": "Крымский Вал, 9"
-        }
-    }
-    place = MOCK_PLACES.get(place_id)
-    if not place:
-        await callback.message.edit_text("❌ Место не найдено.")
-        await callback.answer()
-        return
-
-    rating = place["rating"]
-    stars = "⭐" * int(rating) + ("½" if rating % 1 >= 0.5 else "")
-    stars_text = f"{stars} {rating:.1f} ({place['rating_count']})"
-
-    await callback.message.edit_text(
-        f"📍 *{place['name']}*\n\n"
-        f"{place['description']}\n\n"
-        f"⭐ {stars_text}\n"
-        f"📌 {place['address']}",
-        reply_markup=get_place_keyboard(place_id),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
+# ℹ️ Кнопка «Подробнее» уже обрабатывается в review_router.py
